@@ -115,7 +115,7 @@ def generate_mesh_config(crop_path, zarr_path, input_csv, project_dir):
                     "check_mesh_validity": False,
                     "remove_smallest_components": False,
                     "do_analysis": False,
-                    "do_legacy_neuroglancer": True,
+                    "do_singleres_multires_neuroglancer": True,
                 }
 
                 with open(f"{crop_dir}/run-config.yaml", "w") as f:
