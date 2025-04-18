@@ -26,6 +26,8 @@ instance_classes = [
     "np",
     "mt",
     "cell",
+    "yolk",
+    "isg",
 ]
 
 
@@ -40,9 +42,23 @@ def cli():
 
 
 @click.command()
-@click.option("--crop_path", "-c", type=str, prompt="Path to crops")
+@click.option("--crop_path", "-c", type=str, help="Path to crops", default=None)
+@click.option(
+    "--zarr_path",
+    "-z",
+    type=str,
+    help="Path to parent directory of crop",
+    default=None,
+)
 @click.option("--input_csv", "-i", type=str, prompt="Path to csv")
-def generate_mesh_config(crop_path, input_csv):
+@click.option(
+    "--project_dir",
+    "-p",
+    type=str,
+    help="Base crop path that will be in the default location",
+    default=None,
+)
+def generate_mesh_config(crop_path, zarr_path, input_csv, project_dir):
     df = pd.read_csv(input_csv)
     collections = df.collection.unique()
     # delete rows where column collection equals jrc_mus-pancreas-1
@@ -52,7 +68,9 @@ def generate_mesh_config(crop_path, input_csv):
 
     for current_collection in collections:
         collection_df = df[df["collection"] == current_collection]
-        zarr_path = f"{crop_path}/{current_collection}/groundtruth.zarr"  # f"/nrs/cellmap/bennettd/data/crop_tests/{current_collection}.zarr"
+        if zarr_path is None:
+            zarr_path = f"{crop_path}/{current_collection}/groundtruth.zarr"  # f"/nrs/cellmap/bennettd/data/crop_tests/{current_collection}.zarr"
+        zarr_path = zarr_path.replace("__collection__", current_collection)
         for _, row in collection_df.iterrows():
 
             crop = f"crop{row.crop_number}"
@@ -69,8 +87,18 @@ def generate_mesh_config(crop_path, input_csv):
                     #     (dataset_name not in instance_classes) and dataset_name != "all"
                     # ):
                     continue
+                base_path = "/groups/cellmap/cellmap/ackermand/new_meshes/scripts/single_resolution/crop_checks"
+                if project_dir:
+                    base_crop_path = f"{project_dir}/crop_check_updated_{date}"
+                else:
+                    # default for segmentation challenge
+                    base_crop_path = f"crop_check_updated_{date}"
+                base_organelle_path = (
+                    f"{base_crop_path}/{current_collection}/{crop}/{dataset_name}"
+                )
 
-                crop_dir = f"/groups/cellmap/cellmap/ackermand/new_meshes/scripts/single_resolution/crop_check_updated_{date}/{current_collection}/{crop}/{dataset_name}"
+                crop_dir = f"{base_path}/{base_organelle_path}"
+
                 os.makedirs(name=crop_dir, exist_ok=True)
                 os.system(
                     f"cp ../../../default_meshes/dask-config.yaml {crop_dir}/dask-config.yaml"
@@ -79,7 +107,7 @@ def generate_mesh_config(crop_path, input_csv):
                 run_config_yaml = {
                     # "input_path": f"/nrs/cellmap/bennettd/data/crop_tests/{current_collection}.zarr/{crop}/{dataset_name}/s0",
                     "input_path": f"{zarr_path}/{crop}/{dataset_name}/s0",
-                    "output_directory": f"/nrs/cellmap/ackermand/new_meshes/meshes/crop_check_updated_{date}/{current_collection}/{crop}/{dataset_name}",
+                    "output_directory": f"/nrs/cellmap/ackermand/new_meshes/meshes/crop_checks/{base_organelle_path}",
                     "read_write_block_shape_pixels": [1250, 1250, 1250],
                     "downsample_factor": 0,
                     "target_reduction": 0.5,
@@ -99,10 +127,24 @@ def generate_mesh_config(crop_path, input_csv):
 
 
 @click.command()
-@click.option("--crop_path", "-c", type=str, prompt="Path to crops")
+@click.option("--crop_path", "-c", type=str, help="Path to crops", default=None)
+@click.option(
+    "--zarr_path",
+    "-z",
+    type=str,
+    help="Path to parent directory of crop",
+    default=None,
+)
 @click.option("--mesh_path", "-p", type=str, prompt="Path to meshes")
 @click.option("--input_csv", "-i", type=str, prompt="Path to csv")
-def get_neuroglancer_links(crop_path, mesh_path, input_csv):
+@click.option("--csv_output_dir", "-o", type=str, help="CSV output dir", default=None)
+@click.option("--use_s3", type=bool, help="Use s3 path")
+def get_neuroglancer_links(
+    crop_path, zarr_path, mesh_path, input_csv, csv_output_dir, use_s3
+):
+    if csv_output_dir:
+        os.makedirs(csv_output_dir, exist_ok=True)
+
     def is_dir_empty_except_hidden(path):
         return all(f.startswith(".") for f in os.listdir(path))
 
@@ -122,23 +164,42 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
         collection_contrast = df_contrasts.loc[
             df_contrasts["collection"] == current_collection
         ]
-        contrast_min = int(collection_contrast["min"].iloc[0])
-        contrast_max = int(collection_contrast["max"].iloc[0])
 
-        output_dir = f"/nrs/cellmap/ackermand/viewer_states/crop_check_updated_{date}/janelia-cosem-datasets/{current_collection}"
+        contrast_min = 0
+        contrast_max = 255
+        if not collection_contrast.empty:
+            contrast_min = int(collection_contrast["min"].iloc[0])
+            contrast_max = int(collection_contrast["max"].iloc[0])
 
-        os.makedirs(output_dir, exist_ok=True)
+        yaml_output_dir = f"/nrs/cellmap/ackermand/viewer_states/crop_check_updated_{date}/janelia-cosem-datasets/{current_collection}"
+
+        os.makedirs(yaml_output_dir, exist_ok=True)
 
         collection_df = df[df["collection"] == current_collection]
+        if zarr_path is None:
+            zarr_path = f"{crop_path}/{current_collection}/groundtruth.zarr"  # f"/nrs/cellmap/bennettd/data/crop_tests/{current_collection}.zarr"
+        zarr_path = zarr_path.replace("__collection__", current_collection)
 
-        zarr_path = f"{crop_path}/{current_collection}/groundtruth.zarr"  # f"/nrs/cellmap/bennettd/data/crop_tests/{current_collection}.zarr"
+        # viewer = neuroglancer.Viewer()
+        # with viewer.txn() as s:
+        #     if use_s3:
+        #         s.layers["raw"] = neuroglancer.ImageLayer(
+        #             source=f"zarr://s3://janelia-cosem-datasets/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint8",
+        #             shaderControls={
+        #                 "normalized": {"range": [contrast_min, contrast_max]}
+        #             },
+        #         )
+        #     else:
+        #         if os.path.exists(
+        #             f"/nrs/cellmap/data/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint8"
+        #         ):
+        #             raw_path = f"nrs/data/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint8"
+        #         else:
+        #             raw_path = f"nrs/data/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-int16"
 
-        viewer = neuroglancer.Viewer()
-        with viewer.txn() as s:
-            s.layers["raw"] = neuroglancer.ImageLayer(
-                source=f"zarr://s3://janelia-cosem-datasets/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint8",
-                shaderControls={"normalized": {"range": [contrast_min, contrast_max]}},
-            )
+        #         s.layers["raw"] = neuroglancer.ImageLayer(
+        #             source=f"zarr://https://cellmap-vm1.int.janelia.org/{raw_path}",
+        #         )
         have_set_position = False
         for _, row in collection_df.iterrows():
             if not only_do_alls:
@@ -159,12 +220,31 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
             else:
                 viewer = neuroglancer.Viewer()
                 with viewer.txn() as s:
-                    s.layers["raw"] = neuroglancer.ImageLayer(
-                        source=f"zarr://s3://janelia-cosem-datasets/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint8",
-                        shaderControls={
-                            "normalized": {"range": [contrast_min, contrast_max]}
-                        },
-                    )
+                    if use_s3:
+                        s.layers["raw"] = neuroglancer.ImageLayer(
+                            source=f"zarr://s3://janelia-cosem-datasets/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint8",
+                            shaderControls={
+                                "normalized": {"range": [contrast_min, contrast_max]}
+                            },
+                        )
+                    else:
+                        if os.path.exists(
+                            f"/nrs/cellmap/data/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint8"
+                        ):
+                            raw_path = f"nrs/data/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint8"
+                        elif os.path.exists(
+                            f"/nrs/cellmap/data/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-int16"
+                        ):
+                            raw_path = f"nrs/data/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-int16"
+                        else:
+                            raw_path = f"nrs/data/{current_collection}/{current_collection}.zarr/recon-1/em/fibsem-uint16"
+
+                        s.layers["raw"] = neuroglancer.ImageLayer(
+                            source=f"zarr://https://cellmap-vm1.int.janelia.org/{raw_path}",
+                            shaderControls={
+                                "normalized": {"range": [contrast_min, contrast_max]}
+                            },
+                        )
                 dataset_names = os.listdir(full_crop_path)
 
             for dataset_name in dataset_names:
@@ -179,7 +259,11 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
                     if "info" not in os.listdir(
                         f"{mesh_path}/{current_collection}/{crop}/{dataset_name}/meshes"
                     ):
-                        ds = open_ds(zarr_path, f"{crop}/{dataset_name}/s0")
+                        path_split = full_crop_path.split(".zarr/")
+                        ds = open_ds(
+                            f"{path_split[0]}.zarr",
+                            f"{path_split[1]}/{dataset_name}/s0",
+                        )
                         data = ds.to_ndarray()
                         uniques = np.unique(data)
                         if len(uniques) == 1:
@@ -213,7 +297,7 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
                         source=[image_source]
                     )
                 else:
-                    mesh_source = f"precomputed://https://cellmap-vm1.int.janelia.org/nrs/ackermand/new_meshes/meshes/crop_check_updated_{date}/{current_collection}/{crop}/{dataset_name}/meshes"
+                    mesh_source = f"precomputed://https://cellmap-vm1.int.janelia.org/nrs/ackermand/new_meshes/meshes/crop_checks/crop_check_updated_{date}/{current_collection}/{crop}/{dataset_name}/meshes"
                     # mesh_source = f"precomputed://s3://janelia-cosem-datasets/{current_collection}/neuroglancer/mesh/groundtruth/{crop}/{dataset_name}"
                     s.layers[f"{crop}_{dataset_name}"] = neuroglancer.SegmentationLayer(
                         source=[image_source, mesh_source], segments=segments
@@ -223,10 +307,12 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
                     s.layers[f"{crop}_{dataset_name}"].visible = False
 
                 if not have_set_position:
+                    path_split = full_crop_path.split(".zarr/")
                     ds = open_ds(
-                        zarr_path,
-                        f"{crop}/{dataset_name}/s0",
+                        f"{path_split[0]}.zarr",
+                        f"{path_split[1]}/{dataset_name}/s0",
                     )
+
                     position = (ds.roi.begin + ds.roi.end) / 2
                     s.position = position[::-1]
 
@@ -255,7 +341,7 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
             if not only_do_alls:
                 viewer_state = s.to_json()
                 output_file = (
-                    f"{output_dir}/neuroglancer-{current_collection}-{crop}.json"
+                    f"{yaml_output_dir}/neuroglancer-{current_collection}-{crop}.json"
                 )
                 with open(f"{output_file}", "w") as json_file:
                     json.dump(viewer_state, json_file, indent=4)
@@ -276,7 +362,7 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
 
         # Write the JSON data to a file
         if only_do_alls:
-            output_file = f"{output_dir}/neuroglancer-{current_collection}.json"
+            output_file = f"{yaml_output_dir}/neuroglancer-{current_collection}.json"
             with open(f"{output_file}", "w") as json_file:
                 json.dump(viewer_state, json_file, indent=4)
 
@@ -284,14 +370,19 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
             neuroglancer_url = f"https://neuroglancer-demo.appspot.com#!https://cellmap-vm1.int.janelia.org/{output_file}"
             all_info.append((current_collection, neuroglancer_url))
 
-    if only_do_alls:
-        output_csv_name = f"SegmentationChallengeWithNeuroglancerURLs_{date}_all"
-        df = pd.DataFrame(all_info, columns=["collection", "url"])
+    suffix = "_all" if only_do_alls else ""
+    if csv_output_dir:
+        output_csv = f"{csv_output_dir}/neuroglancerURLs_{date}{suffix}.csv"
     else:
-        output_csv_name = f"SegmentationChallengeWithNeuroglancerURLs_{date}"
-        df = pd.DataFrame(all_info, columns=["crop_number", "collection", "url"])
+        csv_output_dir = "./"
+        output_csv = f"{csv_output_dir}/SegmentationChallengeWithNeuroglancerURLs_{date}{suffix}.csv"
 
-        df.to_csv(f"{output_csv_name}.csv", index=False)
+    if only_do_alls:
+        df = pd.DataFrame(all_info, columns=["collection", "url"])
+        df.to_csv(f"{output_csv}", index=False)
+    else:
+        df = pd.DataFrame(all_info, columns=["crop_number", "collection", "url"])
+        df.to_csv(f"{output_csv}", index=False)
         # df["url"] = df["url"].replace(
         #     f"https://cellmap-vm1.int.janelia.org/nrs/ackermand/viewer_states/crop_check_updated_{date}/",
         #     "s3://",
@@ -309,9 +400,9 @@ def get_neuroglancer_links(crop_path, mesh_path, input_csv):
         # df.to_csv(f"{output_csv_name}_s3.csv", index=False)
 
         # if len(failed_meshification) > 0:
-        failed_df = pd.DataFrame(failed_meshification, columns=["failed_paths"])
-        failed_df.to_csv(f"failed_meshification_{date}.csv", index=False)
-        print(failed_df)
+    failed_df = pd.DataFrame(failed_meshification, columns=["failed_paths"])
+    failed_df.to_csv(f"{csv_output_dir}/failed_meshification_{date}.csv", index=False)
+    print(failed_df)
 
 
 cli.add_command(generate_mesh_config)
@@ -319,3 +410,5 @@ cli.add_command(get_neuroglancer_links)
 
 if __name__ == "__main__":
     cli()
+
+# %%

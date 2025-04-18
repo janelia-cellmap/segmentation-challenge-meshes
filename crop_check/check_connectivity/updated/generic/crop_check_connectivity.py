@@ -30,6 +30,8 @@ instance_classes = [
     "np",
     "mt",
     "cell",
+    "yolk",
+    "isg",
 ]
 
 
@@ -37,7 +39,7 @@ def is_dir_empty_except_hidden(path):
     return all(f.startswith(".") for f in os.listdir(path))
 
 
-def get_neuroglancer_url(row, crop_path, mesh_path):
+def get_neuroglancer_url(row, full_crop_path, mesh_path):
     collection = row["collection"]
     raw_zarr_path = f"/nrs/cellmap/data/{collection}/{collection}.zarr"
     output_dir = f"/nrs/cellmap/ackermand/crop_check_updated/viewer_states/{collection}"
@@ -46,12 +48,28 @@ def get_neuroglancer_url(row, crop_path, mesh_path):
     viewer = neuroglancer.Viewer()
     have_set_position = False
     with viewer.txn() as s:
+        if os.path.exists(
+            f"/nrs/cellmap/data/{collection}/{collection}.zarr/recon-1/em/fibsem-uint8"
+        ):
+            raw_path = (
+                f"nrs/data/{collection}/{collection}.zarr/recon-1/em/fibsem-uint8"
+            )
+        elif os.path.exists(
+            f"/nrs/cellmap/data/{collection}/{collection}.zarr/recon-1/em/fibsem-int16"
+        ):
+            raw_path = (
+                f"nrs/data/{collection}/{collection}.zarr/recon-1/em/fibsem-int16"
+            )
+        else:
+            raw_path = (
+                f"nrs/data/{collection}/{collection}.zarr/recon-1/em/fibsem-uint16"
+            )
+
         s.layers["raw"] = neuroglancer.ImageLayer(
-            source=f"zarr://https://cellmap-vm1.int.janelia.org/nrs/data/{collection}/{collection}.zarr/recon-1/em/fibsem-uint8",
+            source=f"zarr://https://cellmap-vm1.int.janelia.org/{raw_path}",
         )
         crop = f"crop{row.crop_number}"
         # crop_path = f"/nrs/cellmap/zubovy/crop_splits/combined/{collection}/groundtruth.zarr/{crop}"
-        full_crop_path = f"{crop_path}/{collection}/groundtruth.zarr/{crop}"
 
         for organelle_path in glob.glob(f"{full_crop_path}/*"):
             organelle_name = os.path.basename(organelle_path)
@@ -72,7 +90,7 @@ def get_neuroglancer_url(row, crop_path, mesh_path):
             except:
                 print(f"Error in {collection}/{crop}/{organelle_name}")
                 continue
-            
+
             image_source = f'zarr://https://cellmap-vm1.int.janelia.org/{full_crop_path.replace("/nrs/cellmap/","/nrs/")}/{organelle_name}'
             mesh_path_for_neuroglancer = mesh_path.replace("/nrs/cellmap/", "/nrs/")
             mesh_source = f"precomputed://https://cellmap-vm1.int.janelia.org/{mesh_path_for_neuroglancer}/{collection}/{crop}/{organelle_name}/meshes"
@@ -84,9 +102,10 @@ def get_neuroglancer_url(row, crop_path, mesh_path):
                 s.layers[f"{crop}_{organelle_name}"].visible = False
 
             if not have_set_position:
+                path_split = full_crop_path.split(".zarr/")
                 ds = open_ds(
-                    f"{crop_path}/{collection}/groundtruth.zarr",
-                    f"{crop}/{organelle_name}/s0",
+                    f"{path_split[0]}.zarr",
+                    f"{path_split[1]}/{organelle_name}/s0",
                 )
                 position = (ds.roi.begin + ds.roi.end) / 2
                 s.position = position[::-1]
@@ -112,12 +131,16 @@ def get_neuroglancer_url(row, crop_path, mesh_path):
     return neuroglancer_url
 
 
-def process_rows(rows, crop_path, connectivity):
+def process_rows(rows, base_crop_path, connectivity, minimum_cutoff):
     logging.getLogger().setLevel(logging.WARNING)
     # create empty dataframe that matches the input
     output = []
     try:
         for _, row in rows.iterrows():
+            updated_crop_path = base_crop_path.replace(
+                "__collection__", row["collection"]
+            )
+
             collection = row["collection"]
             crop_number = row["crop_number"]
             crop = f"crop{crop_number}"
@@ -128,17 +151,17 @@ def process_rows(rows, crop_path, connectivity):
 
             try:
                 idi = ImageDataInterface(
-                    f"{crop_path}/{collection}/groundtruth.zarr/crop{crop_number}/{organelle_name}/s0"
+                    f"{base_crop_path}/crop{crop_number}/{organelle_name}/s0"
                 )
                 data = idi.to_ndarray_ts()
                 del idi
             except:
                 raise Exception(
-                    f"{crop_path}/{collection}/groundtruth.zarr/crop{crop_number}/{organelle_name}/s0"
+                    f"{updated_crop_path}/{collection}/groundtruth.zarr/crop{crop_number}/{organelle_name}/s0"
                 )
             reconnected = skimage.measure.label(data > 0, connectivity=connectivity)
             ids, counts = np.unique(reconnected[reconnected > 0], return_counts=True)
-            ids = ids[counts <= 5]
+            ids = ids[counts <= minimum_cutoff]
             if len(ids) > 100:
                 small_ids = "more than 100"
             else:
@@ -164,20 +187,41 @@ def process_rows(rows, crop_path, connectivity):
 
 # get local ip
 @click.command()
-@click.option("--crop_path", "-c", type=str, prompt="Path to crops")
+@click.option("--crop_path", "-c", type=str, help="Path to crops", default=None)
+@click.option(
+    "--zarr_path",
+    "-z",
+    type=str,
+    help="Path to parent directory of crop",
+    default=None,
+)
 @click.option("--mesh_path", "-p", type=str, prompt="Path to meshes")
 @click.option("--input_csv", "-i", type=str, prompt="Path to csv")
 @click.option("--output_dir", "-o", type=str, prompt="Path to output directory")
-def main(crop_path, mesh_path, input_csv, output_dir):
+@click.option(
+    "--minimum_cutoff",
+    "-m",
+    type=int,
+    prompt="Minimum number of voxels cutoff",
+    default=5,
+    required=False,
+)
+def main(crop_path, zarr_path, mesh_path, input_csv, output_dir, minimum_cutoff):
     os.makedirs(output_dir, exist_ok=True)
     original_df = pd.read_csv(input_csv)
     new_df_data = []
     for _, row in original_df.iterrows():
-        url = get_neuroglancer_url(row, crop_path, mesh_path)
         crop_number = row["crop_number"]
         collection = row["collection"]
         # crop_path = f"/nrs/cellmap/zubovy/crop_splits/combined/{collection}/groundtruth.zarr/crop{crop_number}"
-        full_crop_path = f"{crop_path}/{collection}/groundtruth.zarr/crop{crop_number}"
+        if zarr_path is None:
+            full_crop_path = (
+                f"{crop_path}/{collection}/groundtruth.zarr/crop{crop_number}"
+            )
+        else:
+            full_crop_path = f"{zarr_path}/crop{crop_number}"
+        full_crop_path = full_crop_path.replace("__collection__", collection)
+        url = get_neuroglancer_url(row, full_crop_path, mesh_path)
         for organelle_path in glob.glob(f"{full_crop_path}/*"):
             organelle_name = os.path.basename(organelle_path)
             if organelle_name in instance_classes:
@@ -193,7 +237,7 @@ def main(crop_path, mesh_path, input_csv, output_dir):
             "small_object_ids",
         ],
     )
-    for connectivity in [1, 2, 3]:
+    for connectivity in [1]:  # , 2, 3]:
         # new_df.to_csv("testing.csv")
         cluster = LocalCluster(
             n_workers=int(os.cpu_count() / 2), threads_per_worker=1, memory_limit="64GB"
@@ -206,16 +250,32 @@ def main(crop_path, mesh_path, input_csv, output_dir):
             print(
                 f'Check {client.cluster.dashboard_link.replace("127.0.0.1",socket.gethostname())}'
             )
+
+            base_crop_path = zarr_path
+            if crop_path:
+                base_crop_path = crop_path + "/__collection__"
             result_ddf = ddf.map_partitions(
-                process_rows, crop_path=crop_path, connectivity=connectivity, meta=ddf
+                process_rows,
+                base_crop_path,
+                connectivity=connectivity,
+                minimum_cutoff=minimum_cutoff,
+                meta=ddf,
             )
             output_df = result_ddf.compute()
 
             output_df.to_csv(
-                f"{output_dir}/isolated_pixels_connectivity_{connectivity}_{date}.csv",
+                f"{output_dir}/isolated_pixels_cutoff_{minimum_cutoff}_connectivity_{connectivity}_{date}.csv",
                 index=False,
             )
 
 
 if __name__ == "__main__":
     main()
+
+# # %%
+# from image_data_interface import ImageDataInterface
+# data = ImageDataInterface("/nrs/cellmap/zubovy/crop_splits/c-elegans/combined//jrc_c-elegans-bw-1/groundtruth.zarr/crop537/lyso/s0").to_ndarray_ts()
+# # %%
+# import numpy as np
+# np.sum(data==1)
+# # %%
